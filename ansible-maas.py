@@ -30,9 +30,11 @@ import re
 import sys
 import uuid
 import pickle
-
+import subprocess
+import ipaddress
 import oauth.oauth as oauth
 import requests
+
 
 class Inventory:
     """Provide several convenience methods to retrieve information from MAAS API."""
@@ -42,12 +44,22 @@ class Inventory:
         self.supported = '2.0'
         self.apikeydocs = 'https://docs.ubuntu.com/maas/2.1/en/manage-cli#log-in-(required)'
 
-        self.maas = os.environ.get("MAAS_API_URL", None)
-        if not self.maas:
-            sys.exit("MAAS_API_URL environment variable not found. Set this to http<s>://<HOSTNAME or IP>/MAAS/api/{}".format(self.supported))
-        self.token = os.environ.get("MAAS_API_KEY", None)
+        self.maas_ip = os.environ.get("MAAS_IP", None)
+        self.maas_user = os.environ.get("MAAS_USER", None)
+        self.token = os.environ.get("MAAS_TOKEN", None)
         if not self.token:
-            sys.exit("MAAS_API_KEY environment variable not found. See {} for getting a MAAS API KEY".format(self.apikeydocs))
+          if not self.maas_ip or not self.maas_user:
+            sys.exit("Set MAAS_IP and MAAS_USER environment variable OR set MAAS_TOKEN environment variable")
+          cmd = "ssh -q " + self.maas_user + "@" + self.maas_ip + " cat /home/" + self.maas_user + "/.maaskey | tr -d '\n'"
+          self.token = subprocess.check_output(cmd, shell=True)
+          if not self.token:
+            sys.exit("Can't retrieve MAAS_TOKEN value, set or debug")
+        self.maas = os.environ.get("MAAS_URL", None)
+        if not self.maas and not self.maas_ip:
+          sys.exit("Set MAAS_IP or MAAS_URL environment variable")
+        if not self.maas and self.maas_ip:
+          self.maas = os.environ.get("MAAS_URL", "http://" + self.maas_ip + ":5240/MAAS/api/2.0")
+        self.ssh_interface = os.environ.get("SSH_INTERFACE", None)
         self.args = None
 
         # Parse command line arguments
@@ -97,6 +109,32 @@ class Inventory:
         request = requests.get(url, headers=headers)
         return json.loads(request.text)
 
+    def ipaddresses(self):
+        headers = self.auth()
+
+        url = "{}/ipaddresses/?all=true".format(self.maas.rstrip())
+        request = requests.get(url, headers=headers)
+        response = json.loads(request.text)
+        ipaddresses_list = [item["ip"] for item in response]
+        return ipaddresses_list
+
+    def ipranges(self):
+        """Fetch a simple list of available tags from MAAS."""
+        headers = self.auth()
+
+        url = "{}/ipranges/".format(self.maas.rstrip())
+        request = requests.get(url, headers=headers)
+        response = json.loads(request.text)
+        iprange_list = []
+        for item in response:
+          if item["comment"] == "osa":
+            ip = ipaddress.ip_network(item["subnet"]["cidr"])
+            iprange_list.append(str(ip[0]) + "," + item["start_ip"])
+            iprange_list.append(item["end_ip"] + "," + str(ip[-1]))
+          else:
+            iprange_list.append(item["start_ip"] + "," + item["end_ip"])
+        return iprange_list
+
     def tags(self):
         """Fetch a simple list of available tags from MAAS."""
         headers = self.auth()
@@ -116,9 +154,10 @@ class Inventory:
         return json.loads(request.text)
 
     def inventory(self):
-        """Look up hosts by tag(s) and zone(s) and return a dict that Ansible will understand as an inventory."""
+        """Look up hosts by tag(s) and return a dict that Ansible will understand as an inventory."""
         tags = self.tags()
         ansible = {}
+
         for tag in tags:
             headers = self.auth()
             url = "{}/tags/{}/?op=machines".format(self.maas.rstrip(), tag)
@@ -128,47 +167,74 @@ class Inventory:
             hosts = []
             for server in response:
                 if server['status_name'] == 'Deployed':
-                    hosts.append(server['fqdn'])
+                    hosts.append(server['hostname'])
                     ansible[group_name] = {
                         "hosts": hosts,
                         "vars": {}
                     }
 
-        nodes = self.nodes()
-        hosts = []
-        for node in nodes:
-           zone = node['zone']['name']
-           if node['node_type_name'] != 'Machine' or node['status_name'] != 'Deployed':
-             continue
-           hosts.append(node['fqdn'])
-           ansible[zone] = {
-                "hosts": hosts,       
-                "vars": {}
-           }
-        # PS 2015-09-03: Create metadata block for Ansible's Dynamic Inventory
-        # The below code gets a dump of ALL nodes in MAAS and then builds out a _meta JSON attribute.
-        # node_dump = self.nodes()
-        # nodes = {
-        #     '_meta': {
-        #         'hostvars': {}
-        #     }
-        # }
-        #
-        # for node in node_dump:
-        #     if not node['tag_names']:
-        #         pass
-        #     else:
-        #         nodes['_meta']['hostvars'][node['hostname']] = {
-        #             'mac_address': node['macaddress_set'][0]['mac_address'],
-        #             'system_id': node['system_id'],
-        #             'power_type': node['power_type'],
-        #             'os': node['osystem'],
-        #             'os_release': node['distro_series']
-        #         }
+        node_dump = self.nodes()
+        nodes = {
+             '_meta': {
+                 'hostvars': {}
+             }
+        }
 
-        # Need to merge ansible and nodes dict()s as a shallow copy, or Ansible shits itself and throws an error
+        reBrObj = re.compile('br-')
+        allvars = {
+          'networks': {}
+        }
+        for node in node_dump:
+            if 'status_name' in node and node['status_name'] == 'Deployed':
+                ssd_available = []
+                rotary_available = []
+                if 'blockdevice_set' in node:
+                  for device in node['blockdevice_set']:
+                    if device['used_for'] == 'Unused':
+                      if 'rotary' in device['tags']:
+                        rotary_available.append({
+                          'name': device['name'],
+                          'weight': device['available_size']/107374182400,
+                          'tags': device['tags']
+                        })
+                      if 'ssd' in device['tags']:
+                        ssd_available.append({
+                          'name': device['name'],
+                          'weight': device['available_size']/107374182400,
+                          'tags': device['tags']
+                        })
+                ansible_host = ''
+                for interface in node['interface_set']:
+                  if interface['name'] == self.ssh_interface:
+                    ansible_host = interface['links'][0]['ip_address']
+                  if (reBrObj.match(interface['name'])):
+                    name = re.search("br-(.*)", interface['name']).group(1)
+                    if 'subnet' in interface['links'][0]:
+                      cidr = interface['links'][0]['subnet']['cidr']
+                      allvars['networks'][name] = {
+                        'cidr': cidr
+                      }
+                nodes['_meta']['hostvars'][node['hostname']] = {
+                    'mac_address': node['interface_set'][0]['mac_address'],
+                    'ansible_host': ansible_host,
+                    'ssd_available': ssd_available,
+                    'rotary_available': rotary_available,
+                    'boot_interface': node['boot_interface']['name']
+                }
+                reObj = re.compile('swift_zone')
+                for tag in node['tag_names']:
+                  if(reObj.match(tag)):
+                    swift_zone = re.match('.*?([0-9]+)$', tag).group(1)
+                    nodes['_meta']['hostvars'][node['hostname']]['swift_zone'] = swift_zone
+
+        allvars['networks']['used_ips'] = {
+          "maas": self.ipranges() + self.ipaddresses()
+        }
+        ansible['all'] = {
+          "vars": allvars
+        }
         result = ansible.copy()
-        # result.update(nodes)
+        result.update(nodes)
         return result
 
     def nodes(self):

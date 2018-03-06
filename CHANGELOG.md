@@ -1,4 +1,10 @@
+# 3.0.0
+
+Reworked the code to return hostvars, groupvars and vars about interfaces, disk,
+networks...
+
 # 2.0.1
+
 
 Only return machines that are in "Deployed" status to Ansible. - Thanks @v92
 
